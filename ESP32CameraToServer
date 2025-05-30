@@ -40,23 +40,42 @@ const char* websocket_path = "/";
 
 // Camera streaming variables
 bool websocket_connected = false;
+bool client_identified = false;
 unsigned long lastFrameTime = 0;
 const unsigned long frameInterval = 100; // 100ms = 10 FPS
+unsigned long lastHeartbeat = 0;
+const unsigned long heartbeatInterval = 30000; // 30 seconds
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
       Serial.println("[WebSocket] Disconnected!");
       websocket_connected = false;
+      client_identified = false;
       break;
       
     case WStype_CONNECTED:
       Serial.printf("[WebSocket] Connected to: %s\n", payload);
       websocket_connected = true;
+      client_identified = false;
+      // Send identification message immediately after connection
+      webSocket.sendTXT("esp32-client");
+      Serial.println("[WebSocket] Sent ESP32 client identification");
       break;
       
     case WStype_TEXT:
       Serial.printf("[WebSocket] Received text: %s\n", payload);
+      
+      // Check for server responses
+      if (strcmp((char*)payload, "connection-established") == 0) {
+        Serial.println("[WebSocket] Server acknowledged connection");
+        // Send identification again to be sure
+        delay(100);
+        webSocket.sendTXT("esp32-client");
+      } else if (strcmp((char*)payload, "esp32-client-confirmed") == 0) {
+        Serial.println("[WebSocket] ESP32 client identification confirmed by server");
+        client_identified = true;
+      }
       break;
       
     case WStype_BIN:
@@ -66,6 +85,15 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     case WStype_ERROR:
       Serial.printf("[WebSocket] Error occurred\n");
       websocket_connected = false;
+      client_identified = false;
+      break;
+      
+    case WStype_PING:
+      Serial.println("[WebSocket] Received ping");
+      break;
+      
+    case WStype_PONG:
+      Serial.println("[WebSocket] Received pong");
       break;
       
     default:
@@ -77,6 +105,7 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+  Serial.println("ESP32-CAM WebSocket Client Starting...");
 
   // Initialize camera configuration
   camera_config_t config;
@@ -131,6 +160,8 @@ void setup() {
     Serial.printf("Camera init failed with error 0x%x\n", err);
     return;
   }
+
+  Serial.println("Camera initialized successfully");
 
   // Get camera sensor for additional configuration
   sensor_t * s = esp_camera_sensor_get();
@@ -198,10 +229,26 @@ void loop() {
   // Handle WebSocket communication
   webSocket.loop();
   
-  // Send camera frame if WebSocket is connected and enough time has passed
-  if (websocket_connected && (millis() - lastFrameTime >= frameInterval)) {
+  // Send camera frame if WebSocket is connected, client is identified, and enough time has passed
+  if (websocket_connected && client_identified && (millis() - lastFrameTime >= frameInterval)) {
     sendCameraFrame();
     lastFrameTime = millis();
+  }
+  
+  // Send periodic heartbeat to ensure we're still identified
+  if (websocket_connected && !client_identified && (millis() - lastHeartbeat >= heartbeatInterval)) {
+    Serial.println("Re-sending identification...");
+    webSocket.sendTXT("esp32-client");
+    lastHeartbeat = millis();
+  }
+  
+  // Print status every 10 seconds
+  static unsigned long lastStatusPrint = 0;
+  if (millis() - lastStatusPrint >= 10000) {
+    Serial.printf("Status - WebSocket: %s, Identified: %s\n", 
+                  websocket_connected ? "Connected" : "Disconnected",
+                  client_identified ? "Yes" : "No");
+    lastStatusPrint = millis();
   }
   
   // Small delay to prevent watchdog timer issues
@@ -221,6 +268,10 @@ void sendCameraFrame() {
     Serial.printf("Frame sent successfully - Size: %u bytes\n", fb->len);
   } else {
     Serial.println("Failed to send frame");
+    // Try to re-identify if frame sending fails
+    if (websocket_connected) {
+      webSocket.sendTXT("esp32-client");
+    }
   }
 
   // Return the frame buffer back to the driver for reuse
