@@ -1,0 +1,228 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+
+//
+// WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
+//            Ensure ESP32 Wrover Module or other board with PSRAM is selected
+//            Partial images will be transmitted if image exceeds buffer size
+//
+
+// ===================
+// Select camera model
+// ===================
+//#define CAMERA_MODEL_WROVER_KIT // Has PSRAM
+//#define CAMERA_MODEL_ESP_EYE // Has PSRAM
+//#define CAMERA_MODEL_ESP32S3_EYE // Has PSRAM
+//#define CAMERA_MODEL_M5STACK_PSRAM // Has PSRAM
+//#define CAMERA_MODEL_M5STACK_V2_PSRAM // M5Camera version B Has PSRAM
+//#define CAMERA_MODEL_M5STACK_WIDE // Has PSRAM
+//#define CAMERA_MODEL_M5STACK_ESP32CAM // No PSRAM
+//#define CAMERA_MODEL_M5STACK_UNITCAM // No PSRAM
+#define CAMERA_MODEL_AI_THINKER // Has PSRAM
+//#define CAMERA_MODEL_TTGO_T_JOURNAL // No PSRAM
+//#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
+#include "camera_pins.h"
+
+// ===========================
+// Enter your WiFi credentials
+// ===========================
+const char* ssid = "AryanPant";
+const char* password = "12345678";
+
+// ===========================
+// WebSocket server configuration
+// ===========================
+WebSocketsClient webSocket;
+const char* websocket_host = "esp32-cam-relay.onrender.com";
+const uint16_t websocket_port = 443;
+const char* websocket_path = "/";
+
+// Camera streaming variables
+bool websocket_connected = false;
+unsigned long lastFrameTime = 0;
+const unsigned long frameInterval = 100; // 100ms = 10 FPS
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WebSocket] Disconnected!");
+      websocket_connected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.printf("[WebSocket] Connected to: %s\n", payload);
+      websocket_connected = true;
+      break;
+      
+    case WStype_TEXT:
+      Serial.printf("[WebSocket] Received text: %s\n", payload);
+      break;
+      
+    case WStype_BIN:
+      Serial.printf("[WebSocket] Received binary length: %u\n", length);
+      break;
+      
+    case WStype_ERROR:
+      Serial.printf("[WebSocket] Error occurred\n");
+      websocket_connected = false;
+      break;
+      
+    default:
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  // Initialize camera configuration
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; // for streaming
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+  
+  // Configure based on PSRAM availability
+  if(psramFound()){
+    Serial.println("PSRAM found - using higher quality settings");
+    config.frame_size = FRAMESIZE_QVGA; // 320x240 for better streaming
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+  } else {
+    Serial.println("PSRAM not found - using lower quality settings");
+    config.frame_size = FRAMESIZE_QQVGA; // 160x120 for limited memory
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+#if defined(CAMERA_MODEL_ESP_EYE)
+  pinMode(13, INPUT_PULLUP);
+  pinMode(14, INPUT_PULLUP);
+#endif
+
+  // Initialize camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return;
+  }
+
+  // Get camera sensor for additional configuration
+  sensor_t * s = esp_camera_sensor_get();
+  
+  // Configure sensor settings for AI_THINKER model
+  if (s->id.PID == OV2640_PID) {
+    s->set_brightness(s, 0);     // -2 to 2
+    s->set_contrast(s, 0);       // -2 to 2
+    s->set_saturation(s, 0);     // -2 to 2
+    s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect)
+    s->set_whitebal(s, 1);       // 0 = disable , 1 = enable
+    s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
+    s->set_wb_mode(s, 0);        // 0 to 4 - if awb_gain enabled
+    s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
+    s->set_aec2(s, 0);           // 0 = disable , 1 = enable
+    s->set_ae_level(s, 0);       // -2 to 2
+    s->set_aec_value(s, 300);    // 0 to 1200
+    s->set_gain_ctrl(s, 1);      // 0 = disable , 1 = enable
+    s->set_agc_gain(s, 0);       // 0 to 30
+    s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+    s->set_bpc(s, 0);            // 0 = disable , 1 = enable
+    s->set_wpc(s, 1);            // 0 = disable , 1 = enable
+    s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
+    s->set_lenc(s, 1);           // 0 = disable , 1 = enable
+    s->set_hmirror(s, 0);        // 0 = disable , 1 = enable
+    s->set_vflip(s, 0);          // 0 = disable , 1 = enable
+    s->set_dcw(s, 1);            // 0 = disable , 1 = enable
+    s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
+  }
+
+#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+#endif
+
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+  s->set_vflip(s, 1);
+#endif
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize WebSocket connection
+  webSocket.beginSSL(websocket_host, websocket_port, websocket_path);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+
+  Serial.println("ESP32-CAM WebSocket Client Ready!");
+  Serial.printf("Connecting to WebSocket server: %s:%d%s\n", websocket_host, websocket_port, websocket_path);
+}
+
+void loop() {
+  // Handle WebSocket communication
+  webSocket.loop();
+  
+  // Send camera frame if WebSocket is connected and enough time has passed
+  if (websocket_connected && (millis() - lastFrameTime >= frameInterval)) {
+    sendCameraFrame();
+    lastFrameTime = millis();
+  }
+  
+  // Small delay to prevent watchdog timer issues
+  delay(10);
+}
+
+void sendCameraFrame() {
+  // Capture frame from camera
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+
+  // Send binary data through WebSocket
+  if (webSocket.sendBIN(fb->buf, fb->len)) {
+    Serial.printf("Frame sent successfully - Size: %u bytes\n", fb->len);
+  } else {
+    Serial.println("Failed to send frame");
+  }
+
+  // Return the frame buffer back to the driver for reuse
+  esp_camera_fb_return(fb);
+}
